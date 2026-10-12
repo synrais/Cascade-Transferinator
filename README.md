@@ -28,17 +28,38 @@ Drag-and-drop needs `pip install tkinterdnd2`; without it the *Browse* buttons s
   daylight-saving shift FAT shows, so an SD card isn't re-copied every time.
 - Windows long paths (> 260 characters) work.
 
+## Logs
+
+Every run - **including previews** - saves a complete log to the `logs` folder next to the
+app (`cascade-<date>_<time>-preview.txt` / `-sync.txt`). Nothing is cut off, unlike the
+on-screen window which only shows a sample of a big preview. Use **Open last log** /
+**Open logs folder** in the window. Each log contains:
+
+- the source, destination and options used
+- every folder to create and every file to copy, with its size and *why* it is being copied
+  (new / size differs / modified time differs / destination is NEWER and will be overwritten)
+- in mirror mode, every extra file that would be (or was) deleted
+- for real runs: a timestamped line per file COPIED / DELETED / ERROR, and a final result
+
+If the app's own folder isn't writable, logs go to `%LOCALAPPDATA%\CascadeTransferinator\logs`.
+
 ## Options
 
 | Option | Meaning |
 |---|---|
 | Skip hidden and system files | On by default. Also protects them from mirror deletion. `System Volume Information`, `$RECYCLE.BIN` etc. are always skipped. Symlinks/junctions are never followed. |
+| Compare modified times | On by default: a file is re-copied if its size **or** modified time differs. **Untick it** to treat any file with the same size as identical - use this when the destination was filled by a tool that didn't keep timestamps (every file then looks "newer" even though it's the same). A different *size* is always re-copied. The preview tells you how many files differ by time only. |
 | Delete files on destination that aren't on source | Mirror mode (see above). |
 | Preview only | Scan and list what would change; touch nothing. |
 | Verify copies | Re-read each finished copy and compare a hash with what was read from the source. |
 | Re-copy everything | Ignore the size/time comparison. |
 | Flush each file to disk | `fsync` after every file (safe to unplug; slower on many small files). |
 | Chunk | Read/write block size, 1-256 MiB. |
+
+## Remembered settings
+
+*Skip hidden*, *Compare modified times*, *Verify*, *Flush* and *Chunk* are remembered in
+`settings.json` (next to the app). Mirror, Preview and Re-copy everything always start off.
 
 ## Notes
 

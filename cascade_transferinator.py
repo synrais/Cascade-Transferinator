@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -28,7 +30,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Cascade Transferinator"
-__version__ = "2.0"
+__version__ = "2.2"
 
 # Drag & drop (falls back to the Browse buttons if the package is not installed)
 try:
@@ -110,6 +112,114 @@ def fmt_duration(sec: Optional[float]) -> str:
     return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
 
 
+def fmt_ts(ns: int) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ns / 1e9))
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+# ---------- Run logs ----------
+def app_dir() -> str:
+    """Folder the app lives in (the .exe's folder when frozen, else the script's)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def data_dir() -> str:
+    """Where logs and settings live: next to the app, or the user's profile if that isn't writable."""
+    candidates = [
+        app_dir(),
+        os.path.join(os.getenv("LOCALAPPDATA") or os.path.expanduser("~"), "CascadeTransferinator"),
+    ]
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write-test")
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return candidates[-1]
+
+
+def log_dir() -> str:
+    d = os.path.join(data_dir(), "logs")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def settings_path() -> str:
+    return os.path.join(data_dir(), "settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data: dict):
+    try:
+        with open(settings_path(), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except OSError:
+        pass                                      # remembering options is a convenience only
+
+
+def new_log_path(preview: bool) -> str:
+    base = os.path.join(log_dir(), f"cascade-{time.strftime('%Y-%m-%d_%H%M%S')}-{'preview' if preview else 'sync'}")
+    path, n = base + ".txt", 1
+    while os.path.exists(path):
+        n += 1
+        path = f"{base}-{n}.txt"
+    return path
+
+
+def result_text(p: dict) -> str:
+    """One-paragraph outcome, used for the progress label and the log footer."""
+    errs = p.get("errors", [])
+    if p.get("preview"):
+        parts = [f"{p.get('plan_copy_files', 0):,} file(s) to copy ({fmt_bytes(p.get('plan_copy_bytes', 0))})"]
+        if p.get("plan_del_files") or p.get("plan_del_dirs"):
+            parts.append(f"{p['plan_del_files']:,} file(s) and {p['plan_del_dirs']:,} folder(s) to delete")
+        parts.append(f"{p.get('unchanged', 0):,} already up to date")
+        text = "Preview complete - nothing was changed: " + ", ".join(parts) + "."
+        return text + (f" {len(errs)} problem(s) - see the log." if errs else "")
+    if p.get("cancelled"):
+        return "Cancelled - nothing was changed."
+    if p.get("stopped"):
+        return (f"Stopped - {p['copied']:,} file(s) copied, {p['pending']:,} not done. "
+                "Press Start to continue where it left off.")
+    parts = [f"copied {p['copied']:,} file(s) ({fmt_bytes(p['bytes'])})",
+             f"{p['unchanged']:,} already up to date"]
+    if p["deleted_files"] or p["deleted_dirs"]:
+        parts.append(f"deleted {p['deleted_files']:,} file(s), {p['deleted_dirs']:,} folder(s)")
+    if p["kept_dirs"]:
+        parts.append(f"{p['kept_dirs']:,} folder(s) kept (contain skipped files)")
+    parts.append(f"{len(errs)} error(s)")
+    return "Done - " + ", ".join(parts) + f" in {fmt_duration(p['elapsed'])}."
+
+
+_MARKS = {"new": "+ new     ", "changed": "~ changed ", "forced": "~ forced  ", "replace": "! replace "}
+
+
+def _copy_line(rel: str, size: int, reason: str, detail: str, detailed: bool) -> str:
+    if not detailed:                      # on-screen: compact
+        return f"{_MARKS[reason]} {rel}  ({fmt_bytes(size)})"
+    s = f"{_MARKS[reason]} {rel}  [{size:,} bytes]"
+    return s + (f"   <- {detail}" if detail else "")
+
+
 # ---------- Scanning ----------
 def list_dir(path: str, skip_hidden: bool, errors: List[str]):
     """One scandir pass. Returns (dirs, files) as sorted lists of (name, size, mtime_ns)."""
@@ -182,18 +292,20 @@ class _FileError(Exception): ...
 class EngineOptions:
     chunk: int = CHUNK_DEFAULT
     skip_hidden: bool = True     # leave hidden/system files alone (both copying and deleting)
+    compare_time: bool = True    # a differing modified-time makes a file "changed"; off = same size is identical
     mirror: bool = False         # delete destination files/folders that are not on the source
     verify: bool = False         # re-read each copy and compare a hash with what was read from source
     force: bool = False          # re-copy everything, ignoring the size/time comparison
     fsync: bool = True           # flush every file to the device before moving on
     preview: bool = False        # scan and report only; change nothing
+    log_path: Optional[str] = None   # complete run log (every file; nothing truncated)
 
 
 @dataclass
 class Plan:
     dirs: List[str] = field(default_factory=list)                      # folders to create
-    copies: List[Tuple[str, int, int, str]] = field(default_factory=list)  # rel, size, mtime_ns, reason
-    del_files: List[str] = field(default_factory=list)
+    copies: List[Tuple[str, int, int, str, str]] = field(default_factory=list)  # rel, size, mtime_ns, reason, detail
+    del_files: List[Tuple[str, int]] = field(default_factory=list)     # rel, size
     del_dirs: List[str] = field(default_factory=list)
     del_bytes: int = 0
     src_files: int = 0
@@ -201,6 +313,9 @@ class Plan:
     src_bytes: int = 0
     unchanged_files: int = 0
     unchanged_bytes: int = 0
+    time_only: int = 0            # flagged "changed" ONLY because the modified time differs (same size)
+    time_only_bytes: int = 0
+    time_ignored: int = 0         # same size + different time, counted as identical (compare_time off)
     newer_on_dest: int = 0
     src_errors: List[str] = field(default_factory=list)
     dst_errors: List[str] = field(default_factory=list)
@@ -217,6 +332,8 @@ class TransferEngine:
         self._confirm = threading.Event()
         self._choice = "cancel"
         self._cancelled = False
+        self._logf = None
+        self._log_written: Optional[str] = None
 
         self.plan: Optional[Plan] = None
         self.errors: List[str] = []
@@ -257,6 +374,98 @@ class TransferEngine:
 
     def _post(self, kind: str, **payload):
         self.q.put((kind, payload))
+
+    # --- run log: the complete record (the on-screen log is only a summary) ---
+    def _open_log(self):
+        p = self.opts.log_path
+        if not p:
+            return
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            self._logf = open(p, "w", encoding="utf-8-sig", errors="backslashreplace")
+            self._log_written = p
+        except OSError as ex:
+            self._post("status", msg=f"WARNING: could not create the log file ({ex}). Continuing without it.")
+
+    def _lw(self, text: str = ""):
+        if self._logf:
+            try:
+                self._logf.write(text + "\n")
+            except (OSError, ValueError):
+                self._logf = None
+
+    def _event(self, text: str):
+        """Timestamped line that goes to the log file only."""
+        self._lw(f"[{time.strftime('%H:%M:%S')}] {text}")
+
+    def _say(self, msg: str):
+        """Show on screen and record in the log file."""
+        self._post("status", msg=msg)
+        self._lw(msg)
+
+    def _close_log(self):
+        if self._logf:
+            try:
+                self._logf.close()
+            except OSError:
+                pass
+            self._logf = None
+
+    def _write_header(self):
+        o = self.opts
+        yn = lambda b: "yes" if b else "no"
+        self._lw(f"{APP_NAME} {__version__} - {'PREVIEW (nothing is changed)' if o.preview else 'SYNC'}")
+        self._lw(f"Started     : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._lw(f"Source      : {self.src}")
+        self._lw(f"Destination : {self.dst}")
+        self._lw(f"Options     : skip hidden/system={yn(o.skip_hidden)}, "
+                 f"compare modified times={yn(o.compare_time)}, mirror (delete extras)={yn(o.mirror)}, "
+                 f"verify={yn(o.verify)}, re-copy everything={yn(o.force)}, flush to disk={yn(o.fsync)}, "
+                 f"chunk={o.chunk // (1024 * 1024)} MiB")
+        self._lw()
+
+    def _write_plan_to_log(self, plan: Plan, do_delete: bool):
+        lw = self._lw
+        lw("=== FOLDERS TO CREATE (%s) ===" % f"{len(plan.dirs):,}")
+        for rel in plan.dirs:
+            lw(f"+ folder    {rel}{os.sep}")
+        lw()
+        lw(f"=== FILES TO COPY ({len(plan.copies):,} files, {fmt_bytes(plan.copy_bytes)}) ===")
+        for rel, size, _, reason, detail in plan.copies:
+            lw(_copy_line(rel, size, reason, detail, True))
+        lw()
+        if self.opts.mirror:
+            if do_delete:
+                lw(f"=== EXTRA ON DESTINATION - deleted in mirror mode "
+                   f"({len(plan.del_files):,} files, {fmt_bytes(plan.del_bytes)}; {len(plan.del_dirs):,} folders) ===")
+                for rel, size in plan.del_files:
+                    lw(f"- delete    {rel}  [{size:,} bytes]")
+                for rel in plan.del_dirs:
+                    lw(f"- delete    {rel}{os.sep}")
+            else:
+                lw("=== EXTRA ON DESTINATION: none (or deletion was not possible - see warnings above) ===")
+            lw()
+        lw(f"=== ALREADY UP TO DATE: {plan.unchanged_files:,} files ({fmt_bytes(plan.unchanged_bytes)}) - "
+           "not listed ===")
+        if plan.time_ignored:
+            lw(f"    (includes {plan.time_ignored:,} file(s) whose modified time differs but whose size is the "
+               "same - treated as identical because 'Compare modified times' is off)")
+        lw()
+
+    def _write_footer(self, payload: dict):
+        self._lw()
+        self._lw("=== RESULT ===")
+        self._lw(result_text(payload))
+        errs = payload.get("errors", [])
+        if errs:
+            self._lw()
+            self._lw(f"Problems ({len(errs):,}):")
+            for m in errs:
+                self._lw(f"  {m}")
+        self._lw()
+        self._lw(f"Finished    : {time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                 f"(elapsed {fmt_duration(payload.get('elapsed'))})")
+        self._close_log()
 
     # --- progress ---
     def _emit(self, force: bool = False):
@@ -314,19 +523,33 @@ class TransferEngine:
             else:
                 plan.src_files += 1
                 plan.src_bytes += size
-                reason = None
+                reason = detail = ""
                 if st is None:
                     reason = "new"
                 elif not stat.S_ISREG(st.st_mode):
                     reason = "replace"
+                    detail = "a folder with this name exists on the destination"
                 elif o.force:
                     reason = "forced"
+                    detail = "'Re-copy everything' is on"
                 elif st.st_size != size or not same_mtime(st.st_mtime_ns, mtime_ns):
-                    reason = "changed"
-                    if st.st_mtime_ns > mtime_ns + MTIME_TOLERANCE_NS:
-                        plan.newer_on_dest += 1
+                    time_only = st.st_size == size
+                    if time_only and not o.compare_time:
+                        plan.time_ignored += 1       # same size => treated as identical (counted as up to date)
+                    else:
+                        reason = "changed"
+                        if time_only:
+                            plan.time_only += 1
+                            plan.time_only_bytes += size
+                            detail = (f"modified time differs: destination {fmt_ts(st.st_mtime_ns)}, "
+                                      f"source {fmt_ts(mtime_ns)}")
+                        else:
+                            detail = f"size differs: destination {st.st_size:,} B, source {size:,} B"
+                        if st.st_mtime_ns > mtime_ns + MTIME_TOLERANCE_NS:
+                            plan.newer_on_dest += 1
+                            detail += " - destination is NEWER and will be overwritten"
                 if reason:
-                    plan.copies.append((rel, size, mtime_ns, reason))
+                    plan.copies.append((rel, size, mtime_ns, reason, detail))
                 else:
                     plan.unchanged_files += 1
                     plan.unchanged_bytes += size
@@ -345,7 +568,7 @@ class TransferEngine:
                 if is_dir:
                     plan.del_dirs.append(rel)
                 else:
-                    plan.del_files.append(rel)
+                    plan.del_files.append((rel, size))
                     plan.del_bytes += size
 
     def _free_bytes(self) -> Optional[int]:
@@ -360,8 +583,17 @@ class TransferEngine:
         except OSError:
             return None
 
-    def _log_preview(self, plan: Plan, limit: int = 300):
+    def _show_preview(self, plan: Plan, limit: int = 300):
+        """On-screen sample of the plan. The complete list always goes to the log file."""
+        total = len(plan.dirs) + len(plan.copies) + len(plan.del_files) + len(plan.del_dirs)
+        if total == 0:
+            return
+        if total > limit:
+            where = "the saved log file" if self._log_written else "this window (no log file could be written)"
+            self._post("status", msg=f"Showing the first {limit:,} of {total:,} planned changes here - "
+                                     f"the complete list is in {where}.")
         shown = 0
+
         def line(text):
             nonlocal shown
             if shown < limit:
@@ -369,15 +601,12 @@ class TransferEngine:
             shown += 1
         for rel in plan.dirs:
             line(f"  + folder   {rel}")
-        for rel, size, _, reason in plan.copies:
-            mark = {"new": "+ new    ", "changed": "~ changed", "forced": "~ forced ", "replace": "! replace"}[reason]
-            line(f"  {mark} {rel}  ({fmt_bytes(size)})")
-        for rel in plan.del_files:
+        for rel, size, _, reason, detail in plan.copies:
+            line("  " + _copy_line(rel, size, reason, detail, False))
+        for rel, size in plan.del_files:
             line(f"  - delete   {rel}")
         for rel in plan.del_dirs:
             line(f"  - delete   {rel}{os.sep}")
-        if shown > limit:
-            self._post("status", msg=f"  ... and {shown - limit:,} more")
 
     # --- file operations ---
     @staticmethod
@@ -484,7 +713,7 @@ class TransferEngine:
     def _delete_phase(self, plan: Plan):
         self._phase = "Deleting"
         self._del_total = len(plan.del_files) + len(plan.del_dirs)
-        for rel in plan.del_files:
+        for rel, _size in plan.del_files:
             self._check_stop()
             self._cur = rel
             path = ext(os.path.join(self.dst, rel))
@@ -495,11 +724,14 @@ class TransferEngine:
                     os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
                     os.remove(path)
                 self.deleted_files += 1
+                self._event(f"DELETED  {rel}")
             except FileNotFoundError:
                 self.deleted_files += 1
+                self._event(f"DELETED  {rel}  (was already gone)")
             except OSError as ex:
                 self.errors.append(f"delete {rel}: {ex}")
                 self._post("status", msg=f"ERROR deleting {rel}: {ex}")
+                self._event(f"ERROR    deleting {rel}: {ex}")
             self._emit()
         for rel in reversed(plan.del_dirs):          # deepest first
             self._check_stop()
@@ -507,10 +739,13 @@ class TransferEngine:
             try:
                 os.rmdir(ext(os.path.join(self.dst, rel)))
                 self.deleted_dirs += 1
+                self._event(f"DELETED  {rel}{os.sep}")
             except FileNotFoundError:
                 self.deleted_dirs += 1
+                self._event(f"DELETED  {rel}{os.sep}  (was already gone)")
             except OSError:
                 self.kept_dirs += 1                  # still holds skipped (hidden/system) items
+                self._event(f"KEPT     {rel}{os.sep}  (still contains skipped hidden/system items)")
             self._emit()
         self._emit(force=True)
 
@@ -522,10 +757,12 @@ class TransferEngine:
             self._check_stop()
             try:
                 os.makedirs(ext(os.path.join(self.dst, rel)), exist_ok=True)
+                self._event(f"FOLDER   {rel}{os.sep}")
             except OSError as ex:
                 self.errors.append(f"folder {rel}: {ex}")
                 self._post("status", msg=f"ERROR creating folder {rel}: {ex}")
-        for rel, size, _, _ in plan.copies:
+                self._event(f"ERROR    creating folder {rel}: {ex}")
+        for rel, size, _, _, _ in plan.copies:
             self._check_stop()
             self._cur = rel
             self._emit(force=True)
@@ -533,11 +770,13 @@ class TransferEngine:
                 self._copy_file(rel)
                 self.files_done += 1
                 self._consec_errors = 0
+                self._event(f"COPIED   {rel}  [{size:,} bytes]")
             except _FileError as ex:
                 self.files_failed += 1
                 self.bytes_handled += size           # keep the bar moving
                 self.errors.append(f"{rel}: {ex}")
                 self._post("status", msg=f"ERROR {rel}: {ex}")
+                self._event(f"ERROR    {rel}: {ex}")
                 self._consec_errors += 1
                 if self._consec_errors >= MAX_CONSECUTIVE_ERRORS:
                     raise _Fatal(f"{MAX_CONSECUTIVE_ERRORS} files in a row failed - "
@@ -554,50 +793,53 @@ class TransferEngine:
         o = self.opts
         if not os.path.isdir(ext(self.src)):
             raise _Fatal(f"Source folder does not exist: {self.src}")
-        self._post("status", msg="Scanning source and comparing with destination...")
+        self._say("Scanning source and comparing with destination...")
         plan = self.plan = self._build_plan()
         self.errors.extend(f"(unreadable) {m}" for m in plan.src_errors)
 
         do_delete = False
         if o.mirror:
             if plan.src_errors:
-                self._post("status", msg=f"WARNING: {len(plan.src_errors)} source item(s) could not be read, "
-                                         "so nothing will be deleted from the destination this run.")
+                self._say(f"WARNING: {len(plan.src_errors)} source item(s) could not be read, "
+                          "so nothing will be deleted from the destination this run.")
             elif plan.src_files + plan.src_dirs == 0:
-                self._post("status", msg="WARNING: the source is empty - refusing to delete "
-                                         "everything on the destination.")
+                self._say("WARNING: the source is empty - refusing to delete everything on the destination.")
             else:
-                self._post("status", msg="Looking for extra files on the destination...")
+                self._say("Looking for extra files on the destination...")
                 self._find_extras(plan)
                 do_delete = bool(plan.del_files or plan.del_dirs)
                 for m in plan.dst_errors:
-                    self._post("status", msg=f"WARNING (destination unreadable): {m}")
+                    self._say(f"WARNING (destination unreadable): {m}")
 
         new = sum(1 for c in plan.copies if c[3] == "new")
-        self._post("status", msg=(
-            f"Source: {plan.src_files:,} files ({fmt_bytes(plan.src_bytes)}) in {plan.src_dirs:,} folders"))
-        self._post("status", msg=(
-            f"To copy: {len(plan.copies):,} files ({fmt_bytes(plan.copy_bytes)}) - "
-            f"{new:,} new, {len(plan.copies) - new:,} changed | "
-            f"already up to date: {plan.unchanged_files:,}"))
+        self._say(f"Source: {plan.src_files:,} files ({fmt_bytes(plan.src_bytes)}) in {plan.src_dirs:,} folders")
+        self._say(f"To copy: {len(plan.copies):,} files ({fmt_bytes(plan.copy_bytes)}) - "
+                  f"{new:,} new, {len(plan.copies) - new:,} changed | "
+                  f"already up to date: {plan.unchanged_files:,}")
         if plan.dirs:
-            self._post("status", msg=f"Folders to create: {len(plan.dirs):,}")
+            self._say(f"Folders to create: {len(plan.dirs):,}")
         if do_delete:
-            self._post("status", msg=(
-                f"Extra on destination: {len(plan.del_files):,} files ({fmt_bytes(plan.del_bytes)}), "
-                f"{len(plan.del_dirs):,} folders"))
+            self._say(f"Extra on destination: {len(plan.del_files):,} files ({fmt_bytes(plan.del_bytes)}), "
+                      f"{len(plan.del_dirs):,} folders")
+        if plan.time_ignored:
+            self._say(f"NOTE: {plan.time_ignored:,} same-size file(s) have a different modified time - treated as "
+                      "up to date because 'Compare modified times' is off.")
+        if plan.time_only:
+            self._say(f"HINT: {plan.time_only:,} of the files to copy ({fmt_bytes(plan.time_only_bytes)}) are the "
+                      "SAME size and differ only by modified time. If their content is already identical "
+                      "(e.g. an earlier copy didn't keep timestamps), untick 'Compare modified times' to skip them.")
         if plan.newer_on_dest:
-            self._post("status", msg=(
-                f"NOTE: {plan.newer_on_dest:,} file(s) are NEWER on the destination than on the source "
-                "and will be overwritten with the source version."))
+            self._say(f"NOTE: {plan.newer_on_dest:,} file(s) are NEWER on the destination than on the source "
+                      "and will be overwritten with the source version.")
         free = self._free_bytes()
         if free is not None and plan.copy_bytes > free + (plan.del_bytes if do_delete else 0):
-            self._post("status", msg=(
-                f"WARNING: need about {fmt_bytes(plan.copy_bytes)} but only {fmt_bytes(free)} is free "
-                "on the destination."))
+            self._say(f"WARNING: need about {fmt_bytes(plan.copy_bytes)} but only {fmt_bytes(free)} is free "
+                      "on the destination.")
 
+        self._lw()
+        self._write_plan_to_log(plan, do_delete)
         if o.preview:
-            self._log_preview(plan)
+            self._show_preview(plan)
             return
 
         if do_delete:
@@ -605,17 +847,21 @@ class TransferEngine:
             choice = self._wait_confirm()
             if choice == "cancel":
                 self._cancelled = True
+                self._event("User cancelled at the delete prompt; nothing was changed.")
                 raise _Stopped()
             if choice == "skip":
-                self._post("status", msg="Skipping deletions; copying only.")
+                self._say("Skipping deletions; copying only.")
                 plan.del_files, plan.del_dirs, plan.del_bytes, do_delete = [], [], 0, False
+            else:
+                self._event("User confirmed deletion of the extra files.")
 
         if not (plan.dirs or plan.copies or do_delete):
-            self._post("status", msg="Nothing to do - destination already matches the source.")
+            self._say("Nothing to do - destination already matches the source.")
             return
 
         self.files_total = len(plan.copies)
         self.bytes_total = plan.copy_bytes
+        self._lw("=== RUN ===")
         os.makedirs(ext(self.dst), exist_ok=True)
         if do_delete:
             self._delete_phase(plan)
@@ -623,26 +869,37 @@ class TransferEngine:
 
     def run(self):
         stopped = False
+        self._open_log()
         try:
+            self._write_header()
             self._execute()
         except _Stopped:
             stopped = True
+            self._event("Stopped.")
         except _Fatal as ex:
             self.errors.append(str(ex))
+            self._event(f"FATAL    {ex}")
             self._post("error", msg=str(ex))
         except Exception as ex:                       # never let the worker die silently
             self.errors.append(f"Unexpected error: {ex!r}")
+            self._event(f"FATAL    unexpected error: {ex!r}")
             self._post("error", msg=f"Unexpected error: {ex!r}")
         plan = self.plan
-        self._post(
-            "final",
+        payload = dict(
             copied=self.files_done, bytes=self.bytes_copied,
             unchanged=plan.unchanged_files if plan else 0,
             pending=max(0, self.files_total - self.files_done - self.files_failed),
             deleted_files=self.deleted_files, deleted_dirs=self.deleted_dirs, kept_dirs=self.kept_dirs,
             errors=list(self.errors), stopped=stopped, cancelled=self._cancelled, preview=self.opts.preview,
             elapsed=time.monotonic() - self._t_start,
+            plan_copy_files=len(plan.copies) if plan else 0,
+            plan_copy_bytes=plan.copy_bytes if plan else 0,
+            plan_del_files=len(plan.del_files) if plan else 0,
+            plan_del_dirs=len(plan.del_dirs) if plan else 0,
+            log_path=self._log_written,
         )
+        self._write_footer(payload)                   # finishes + closes the file before the UI hears "final"
+        self._post("final", **payload)
 
 
 # ---------- GUI ----------
@@ -668,35 +925,49 @@ class App:
         # Options
         opts = ttk.LabelFrame(root, text="Options", padding=12)
         opts.pack(fill="x", padx=12, pady=(0, 12))
-        self.skip_hidden_var = tk.BooleanVar(value=True)
+        # The safe, non-destructive choices are remembered between launches. Mirror (delete),
+        # preview and re-copy-everything always start off.
+        saved = load_settings()
+        flag = lambda key, default: saved[key] if isinstance(saved.get(key), bool) else default
+        self.skip_hidden_var = tk.BooleanVar(value=flag("skip_hidden", True))
+        self.compare_time_var = tk.BooleanVar(value=flag("compare_time", True))
+        self.verify_var = tk.BooleanVar(value=flag("verify", False))
+        self.fsync_var = tk.BooleanVar(value=flag("fsync", True))
         self.mirror_var = tk.BooleanVar(value=False)
         self.force_var = tk.BooleanVar(value=False)
-        self.verify_var = tk.BooleanVar(value=False)
-        self.fsync_var = tk.BooleanVar(value=True)
         self.preview_var = tk.BooleanVar(value=False)
+        chunk_saved = saved.get("chunk_mib")
+        chunk_saved = chunk_saved if isinstance(chunk_saved, int) and 1 <= chunk_saved <= 256 else None
 
         ttk.Checkbutton(opts, text="Skip hidden and system files", variable=self.skip_hidden_var)\
             .grid(row=0, column=0, sticky="w")
+        trow = ttk.Frame(opts)
+        trow.grid(row=0, column=1, columnspan=3, sticky="w", padx=(20, 0))
+        ttk.Checkbutton(trow, text="Compare modified times", variable=self.compare_time_var)\
+            .pack(side="left")
+        ttk.Label(trow, text="untick = a file with the same size counts as identical", foreground="#555555")\
+            .pack(side="left", padx=(8, 0))
+
         mrow = ttk.Frame(opts)
-        mrow.grid(row=0, column=1, columnspan=3, sticky="w", padx=(20, 0))
+        mrow.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(mrow, text="Delete files on destination that aren't on source (mirror)",
                         variable=self.mirror_var).pack(side="left")
         ttk.Label(mrow, text="permanent - you'll be asked to confirm", foreground="#b00020")\
             .pack(side="left", padx=(8, 0))
 
         ttk.Checkbutton(opts, text="Preview only (change nothing)", variable=self.preview_var)\
-            .grid(row=1, column=0, sticky="w", pady=(6, 0))
+            .grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Checkbutton(opts, text="Verify copies (re-read + hash)", variable=self.verify_var)\
-            .grid(row=1, column=1, sticky="w", padx=(20, 0), pady=(6, 0))
+            .grid(row=2, column=1, sticky="w", padx=(20, 0), pady=(6, 0))
         ttk.Checkbutton(opts, text="Re-copy everything", variable=self.force_var)\
-            .grid(row=1, column=2, sticky="w", padx=(20, 0), pady=(6, 0))
+            .grid(row=2, column=2, sticky="w", padx=(20, 0), pady=(6, 0))
         ttk.Checkbutton(opts, text="Flush each file to disk (safer, slower)", variable=self.fsync_var)\
-            .grid(row=1, column=3, sticky="w", padx=(20, 0), pady=(6, 0))
+            .grid(row=2, column=3, sticky="w", padx=(20, 0), pady=(6, 0))
 
         chunk_row = ttk.Frame(opts)
-        chunk_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        chunk_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(chunk_row, text="Chunk (MiB):").pack(side="left")
-        self.chunk_var = tk.IntVar(value=CHUNK_DEFAULT // (1024 * 1024))
+        self.chunk_var = tk.IntVar(value=chunk_saved or CHUNK_DEFAULT // (1024 * 1024))
         self.sb_chunk = ttk.Spinbox(chunk_row, from_=1, to=256, textvariable=self.chunk_var, width=6,
                                     command=self._update_chunk_hint)
         self.sb_chunk.pack(side="left", padx=(6, 0))
@@ -712,6 +983,10 @@ class App:
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
+        self.open_log_btn = ttk.Button(btns, text="Open last log", command=self.open_last_log, state="disabled")
+        self.open_log_btn.pack(side="left", padx=(24, 0))
+        ttk.Button(btns, text="Open logs folder", command=self.open_logs_folder).pack(side="left", padx=(8, 0))
+        self.last_log: Optional[str] = None
 
         # Progress group
         panel = ttk.LabelFrame(root, text="Progress", padding=12)
@@ -831,14 +1106,17 @@ class App:
             self._clear_log()
             self.banner_shown = False
 
+        self._save_settings()
         opts = EngineOptions(
             chunk=self._chunk_bytes(),
             skip_hidden=self.skip_hidden_var.get(),
+            compare_time=self.compare_time_var.get(),
             mirror=self.mirror_var.get(),
             verify=self.verify_var.get(),
             force=self.force_var.get(),
             fsync=self.fsync_var.get(),
             preview=self.preview_var.get(),
+            log_path=new_log_path(self.preview_var.get()),
         )
         self.engine = TransferEngine(src, dst, opts, self.progress_q)
         self.worker = threading.Thread(target=self.engine.run, daemon=True)
@@ -855,12 +1133,40 @@ class App:
             self._log("Stopping... (finishing the current chunk)")
             self.stop_btn.config(state="disabled")
 
+    def _save_settings(self):
+        save_settings({
+            "skip_hidden": self.skip_hidden_var.get(),
+            "compare_time": self.compare_time_var.get(),
+            "verify": self.verify_var.get(),
+            "fsync": self.fsync_var.get(),
+            "chunk_mib": self._chunk_bytes() // (1024 * 1024),
+        })
+
+    def _open_path(self, path: str):
+        try:
+            if IS_WIN:
+                os.startfile(path)                                    # noqa: S606 - user's own file/folder
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+        except Exception as ex:
+            messagebox.showerror("Error", f"Couldn't open:\n{path}\n\n{ex}")
+
+    def open_last_log(self):
+        if self.last_log and os.path.exists(self.last_log):
+            self._open_path(self.last_log)
+        else:
+            messagebox.showinfo(APP_NAME, "No log has been written yet.")
+
+    def open_logs_folder(self):
+        self._open_path(log_dir())
+
     def on_close(self):
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno(APP_NAME, "A transfer is still running.\n\nStop it and exit?"):
                 return
             self.engine.stop()
             self.worker.join(timeout=10)
+        self._save_settings()
         self.root.destroy()
 
     # --- Queue/UI pump ---
@@ -912,30 +1218,20 @@ class App:
 
     def _on_final(self, p):
         errs = p.get("errors", [])
-        if p.get("preview"):
-            text = "Preview complete - nothing was changed."
-        elif p.get("cancelled"):
-            text = "Cancelled - nothing was changed."
-        elif p.get("stopped"):
-            text = (f"Stopped - {p['copied']:,} file(s) copied, {p['pending']:,} not done. "
-                    "Press Start to continue where it left off.")
-        else:
-            parts = [f"copied {p['copied']:,} file(s) ({fmt_bytes(p['bytes'])})",
-                     f"{p['unchanged']:,} already up to date"]
-            if p["deleted_files"] or p["deleted_dirs"]:
-                parts.append(f"deleted {p['deleted_files']:,} file(s), {p['deleted_dirs']:,} folder(s)")
-            if p["kept_dirs"]:
-                parts.append(f"{p['kept_dirs']:,} folder(s) kept (contain skipped files)")
-            parts.append(f"{len(errs)} error(s)")
-            text = "Done - " + ", ".join(parts) + f" in {fmt_duration(p['elapsed'])}."
+        text = result_text(p)
         self.lbl_summary.config(text=text)
         self._log(text)
+        log_path = p.get("log_path")
         if errs:
             self._log(f"--- {len(errs)} problem(s) ---")
-            for m in errs[:50]:
+            for m in errs[:25]:
                 self._log("  " + m)
-            if len(errs) > 50:
-                self._log(f"  ... and {len(errs) - 50} more")
+            if len(errs) > 25:
+                self._log(f"  ... and {len(errs) - 25} more" + (" - see the log file." if log_path else ""))
+        if log_path:
+            self.last_log = log_path
+            self.open_log_btn.config(state="normal")
+            self._log(f"Complete log saved: {log_path}")
         self.lbl_eta.config(text="Time left: -")
         self._set_running(False)
 
@@ -944,12 +1240,15 @@ class App:
         banner = (
             "Makes the DESTINATION match the SOURCE - only new or changed files are copied.\n\n"
             "- Compares size + modified time, so re-running transfers only what changed.\n"
+            "  (Untick 'Compare modified times' to treat any same-size file as identical.)\n"
             "  Stopping (or a crash / unplugged drive) is safe: just press Start again to continue.\n"
             "- One file at a time; each folder is finished in cascaded alphabetical order.\n"
             "- Each file is written to a temporary name and renamed when complete, so an interrupted\n"
             "  copy never leaves a half-written file behind.\n"
             "- 'Delete files on destination...' turns on mirror mode (asks before deleting anything).\n"
-            "- Hidden/system files are skipped by default. Symlinks and junctions are never followed.\n\n"
+            "- Hidden/system files are skipped by default. Symlinks and junctions are never followed.\n"
+            "- Every run, including previews, saves a COMPLETE log (nothing cut off) to the 'logs'\n"
+            "  folder - use 'Open last log' when it finishes.\n\n"
             "   Usage:\n"
             "1. Drop (or Browse to) the SOURCE folder or drive on the left.\n"
             "2. Drop (or Browse to) the DESTINATION folder or drive on the right.\n"
