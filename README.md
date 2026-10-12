@@ -1,17 +1,48 @@
-# Cascade Transferinator 🚰
+# Cascade Transferinator - Sync Edition
 
-**Cascade Transferinator** is a file transfer tool designed to copy one directory to another in a smooth, sequential flow.
+Makes one drive/folder **match** another, one file at a time, in cascaded alphabetical
+order. Based on [synrais/Cascade-Transferinator](https://github.com/synrais/Cascade-Transferinator),
+reworked into a real one-way sync.
 
-✨ Features:
-- Copies files **sequentially** to avoid choking the system or overfilling caches.  
-- Processes one file at a time, completing each folder in **cascaded alphabetical order** before moving to the next.  
-- Skips hidden and system files — *only copies what you can see*.  
-- **Save progress / resume log** option lets you pause and resume later.  
-- Simple **drag-and-drop interface** for source and destination folders.  
-- Durable writes using `fsync` ensure your data is safe, even during interruptions.  
+## Use it
 
-🚀 **Usage:**
-1. Drag and drop a **source folder** onto the source box.  
-2. Drag and drop a **destination folder** onto the destination box.  
-3. Press **Start** to begin the transfer.  
+1. Double-click **`Start Cascade Transferinator.bat`** (or `CascadeTransferinator.exe`).
+2. Drop (or *Browse*) the **Source** (copy FROM) and the **Destination** (made to match).
+3. Tick **Preview only** the first time to see exactly what would happen, then press **Start**.
 
+Drag-and-drop needs `pip install tkinterdnd2`; without it the *Browse* buttons still work.
+
+## What a sync does
+
+- Copies files that are **new** or **changed** (size or modified-time differs); skips the rest.
+  Modified-times are preserved on copy, so re-running is fast and only moves what changed.
+- **Stop / crash / unplugged drive = safe.** Press Start again and it carries on - there is no
+  separate resume file to manage.
+- Each file is written to `name.cascade-part` and renamed when complete, so an interrupted
+  copy never leaves a half-written file.
+- Creates empty folders too, so the trees really match.
+- **Mirror** (off by default): also deletes files/folders on the destination that aren't on
+  the source. You get a Yes / No / Cancel prompt with the counts before anything is deleted.
+  It refuses to run if the source is empty or couldn't be fully read.
+- FAT32 / exFAT aware: tolerates the 2-second timestamp resolution and the 1-hour
+  daylight-saving shift FAT shows, so an SD card isn't re-copied every time.
+- Windows long paths (> 260 characters) work.
+
+## Options
+
+| Option | Meaning |
+|---|---|
+| Skip hidden and system files | On by default. Also protects them from mirror deletion. `System Volume Information`, `$RECYCLE.BIN` etc. are always skipped. Symlinks/junctions are never followed. |
+| Delete files on destination that aren't on source | Mirror mode (see above). |
+| Preview only | Scan and list what would change; touch nothing. |
+| Verify copies | Re-read each finished copy and compare a hash with what was read from the source. |
+| Re-copy everything | Ignore the size/time comparison. |
+| Flush each file to disk | `fsync` after every file (safe to unplug; slower on many small files). |
+| Chunk | Read/write block size, 1-256 MiB. |
+
+## Notes
+
+- Sync is **one-way**: Source wins. If a destination file differs and is *newer*, it is still
+  replaced (the log tells you how many files that affects before anything is copied).
+- Deletions are permanent (no Recycle Bin).
+- To rebuild the exe: `pyinstaller --onefile --windowed --collect-all tkinterdnd2 cascade_transferinator.py`
