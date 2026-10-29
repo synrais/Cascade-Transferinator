@@ -48,18 +48,17 @@ If the app's own folder isn't writable, logs go to `%LOCALAPPDATA%\CascadeTransf
 | Option | Meaning |
 |---|---|
 | Skip hidden and system files | On by default. Also protects them from mirror deletion. `System Volume Information`, `$RECYCLE.BIN` etc. are always skipped. Symlinks/junctions are never followed. |
-| Overwrite same-size files that are newer on the destination | Off by default. A file with the same size whose destination modified time is newer than the source is normally left alone (useful when a device like a MiSTer updates file times whenever it touches them). Tick it to overwrite those files from the source. Not remembered between launches. |
+| Overwrite same-size files that are newer on the destination | Off by default. A file with the same size whose destination modified time is newer than the source is normally left alone. Tick it to overwrite those files from the source. Not remembered between launches. |
 | Delete files on destination that aren't on source | Mirror mode (see above). |
 | Preview only | Scan and list what would change; touch nothing. |
 | Verify copies | Re-read each finished copy and compare a hash with what was read from the source. |
-| Re-copy everything | Ignore the size/time comparison. |
 | Flush each file to disk | `fsync` after every file (safe to unplug; slower on many small files). |
 | Chunk | Read/write block size, 1-256 MiB. |
 
 ## Remembered settings
 
 *Skip hidden*, *Verify*, *Flush* and *Chunk* are remembered in
-`settings.json` (next to the app). Mirror, Preview, Re-copy everything and Overwrite same-size newer-on-destination always start off.
+`settings.json` (next to the app). Mirror, Preview and Overwrite same-size newer-on-destination always start off.
 
 ## Notes
 
