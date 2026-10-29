@@ -943,7 +943,7 @@ class App:
             .grid(row=0, column=0, sticky="w")
 
         nrow = ttk.Frame(opts)
-        nrow.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        nrow.grid(row=0, column=1, columnspan=3, sticky="w", padx=(20, 0))
         ttk.Checkbutton(nrow, text="Overwrite same-size files that are newer on the destination",
                         variable=self.newer_dest_same_size_var).pack(side="left")
         ttk.Label(nrow, text="off = leave them alone (e.g. MiSTer touches file times)",
@@ -966,7 +966,7 @@ class App:
             .grid(row=2, column=3, sticky="w", padx=(20, 0), pady=(6, 0))
 
         chunk_row = ttk.Frame(opts)
-        chunk_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        chunk_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(chunk_row, text="Chunk (MiB):").pack(side="left")
         self.chunk_var = tk.IntVar(value=chunk_saved or CHUNK_DEFAULT // (1024 * 1024))
         self.sb_chunk = ttk.Spinbox(chunk_row, from_=1, to=256, textvariable=self.chunk_var, width=6,
