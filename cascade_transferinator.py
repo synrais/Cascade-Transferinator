@@ -292,7 +292,6 @@ class _FileError(Exception): ...
 class EngineOptions:
     chunk: int = CHUNK_DEFAULT
     skip_hidden: bool = True     # leave hidden/system files alone (both copying and deleting)
-    compare_time: bool = True    # a differing modified-time makes a file "changed"; off = same size is identical
     newer_dest_same_size: bool = False  # same-size file whose destination time is newer: overwrite (off = leave it)
     mirror: bool = False         # delete destination files/folders that are not on the source
     verify: bool = False         # re-read each copy and compare a hash with what was read from source
@@ -316,7 +315,7 @@ class Plan:
     unchanged_bytes: int = 0
     time_only: int = 0            # flagged "changed" ONLY because the modified time differs (same size)
     time_only_bytes: int = 0
-    time_ignored: int = 0         # same size + different time, counted as identical (compare_time off)
+    time_ignored: int = 0         # same size, destination newer: counted as identical (overwrite option off)
     newer_on_dest: int = 0
     src_errors: List[str] = field(default_factory=list)
     dst_errors: List[str] = field(default_factory=list)
@@ -420,7 +419,7 @@ class TransferEngine:
         self._lw(f"Source      : {self.src}")
         self._lw(f"Destination : {self.dst}")
         self._lw(f"Options     : skip hidden/system={yn(o.skip_hidden)}, "
-                 f"compare modified times={yn(o.compare_time)}, overwrite same-size dest-newer={yn(o.newer_dest_same_size)}, mirror (delete extras)={yn(o.mirror)}, "
+                 f"overwrite same-size dest-newer={yn(o.newer_dest_same_size)}, mirror (delete extras)={yn(o.mirror)}, "
                  f"verify={yn(o.verify)}, re-copy everything={yn(o.force)}, flush to disk={yn(o.fsync)}, "
                  f"chunk={o.chunk // (1024 * 1024)} MiB")
         self._lw()
@@ -450,7 +449,7 @@ class TransferEngine:
            "not listed ===")
         if plan.time_ignored:
             lw(f"    (includes {plan.time_ignored:,} file(s) whose modified time differs but whose size is the "
-               "same - treated as identical because 'Compare modified times' is off)")
+               "same and the destination is newer - left alone because 'Overwrite same-size files that are newer on the destination' is off)")
         lw()
 
     def _write_footer(self, payload: dict):
@@ -536,7 +535,7 @@ class TransferEngine:
                 elif st.st_size != size or not same_mtime(st.st_mtime_ns, mtime_ns):
                     time_only = st.st_size == size
                     dest_newer = st.st_mtime_ns > mtime_ns + MTIME_TOLERANCE_NS
-                    if time_only and (not o.compare_time or (dest_newer and not o.newer_dest_same_size)):
+                    if time_only and dest_newer and not o.newer_dest_same_size:
                         plan.time_ignored += 1       # same size => treated as identical (counted as up to date)
                     else:
                         reason = "changed"
@@ -824,12 +823,11 @@ class TransferEngine:
             self._say(f"Extra on destination: {len(plan.del_files):,} files ({fmt_bytes(plan.del_bytes)}), "
                       f"{len(plan.del_dirs):,} folders")
         if plan.time_ignored:
-            self._say(f"NOTE: {plan.time_ignored:,} same-size file(s) have a different modified time - treated as "
-                      "up to date because 'Compare modified times' is off.")
+            self._say(f"NOTE: {plan.time_ignored:,} same-size file(s) are newer on the destination - left alone "
+                      "because 'Overwrite same-size files that are newer on the destination' is off.")
         if plan.time_only:
             self._say(f"HINT: {plan.time_only:,} of the files to copy ({fmt_bytes(plan.time_only_bytes)}) are the "
-                      "SAME size and differ only by modified time. If their content is already identical "
-                      "(e.g. an earlier copy didn't keep timestamps), untick 'Compare modified times' to skip them.")
+                      "SAME size and differ only by modified time (newer on the source).")
         if plan.newer_on_dest:
             self._say(f"NOTE: {plan.newer_on_dest:,} file(s) are NEWER on the destination than on the source "
                       "and will be overwritten with the source version.")
@@ -932,7 +930,6 @@ class App:
         saved = load_settings()
         flag = lambda key, default: saved[key] if isinstance(saved.get(key), bool) else default
         self.skip_hidden_var = tk.BooleanVar(value=flag("skip_hidden", True))
-        self.compare_time_var = tk.BooleanVar(value=flag("compare_time", True))
         self.verify_var = tk.BooleanVar(value=flag("verify", False))
         self.fsync_var = tk.BooleanVar(value=flag("fsync", True))
         self.newer_dest_same_size_var = tk.BooleanVar(value=False)
@@ -944,12 +941,6 @@ class App:
 
         ttk.Checkbutton(opts, text="Skip hidden and system files", variable=self.skip_hidden_var)\
             .grid(row=0, column=0, sticky="w")
-        trow = ttk.Frame(opts)
-        trow.grid(row=0, column=1, columnspan=3, sticky="w", padx=(20, 0))
-        ttk.Checkbutton(trow, text="Compare modified times", variable=self.compare_time_var)\
-            .pack(side="left")
-        ttk.Label(trow, text="untick = a file with the same size counts as identical", foreground="#555555")\
-            .pack(side="left", padx=(8, 0))
 
         nrow = ttk.Frame(opts)
         nrow.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -1120,7 +1111,6 @@ class App:
         opts = EngineOptions(
             chunk=self._chunk_bytes(),
             skip_hidden=self.skip_hidden_var.get(),
-            compare_time=self.compare_time_var.get(),
             newer_dest_same_size=self.newer_dest_same_size_var.get(),
             mirror=self.mirror_var.get(),
             verify=self.verify_var.get(),
@@ -1147,7 +1137,6 @@ class App:
     def _save_settings(self):
         save_settings({
             "skip_hidden": self.skip_hidden_var.get(),
-            "compare_time": self.compare_time_var.get(),
             "verify": self.verify_var.get(),
             "fsync": self.fsync_var.get(),
             "chunk_mib": self._chunk_bytes() // (1024 * 1024),
@@ -1251,7 +1240,7 @@ class App:
         banner = (
             "Makes the DESTINATION match the SOURCE - only new or changed files are copied.\n\n"
             "- Compares size + modified time, so re-running transfers only what changed.\n"
-            "  (Untick 'Compare modified times' to treat any same-size file as identical.)\n"
+            "  (Same-size files newer on the destination are left alone unless you tick the overwrite box.)\n"
             "  Stopping (or a crash / unplugged drive) is safe: just press Start again to continue.\n"
             "- One file at a time; each folder is finished in cascaded alphabetical order.\n"
             "- Each file is written to a temporary name and renamed when complete, so an interrupted\n"
