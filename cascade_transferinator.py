@@ -293,6 +293,7 @@ class EngineOptions:
     chunk: int = CHUNK_DEFAULT
     skip_hidden: bool = True     # leave hidden/system files alone (both copying and deleting)
     compare_time: bool = True    # a differing modified-time makes a file "changed"; off = same size is identical
+    newer_same_size: bool = False  # same-size file whose source time is newer: overwrite (off = same size is identical)
     mirror: bool = False         # delete destination files/folders that are not on the source
     verify: bool = False         # re-read each copy and compare a hash with what was read from source
     force: bool = False          # re-copy everything, ignoring the size/time comparison
@@ -419,7 +420,7 @@ class TransferEngine:
         self._lw(f"Source      : {self.src}")
         self._lw(f"Destination : {self.dst}")
         self._lw(f"Options     : skip hidden/system={yn(o.skip_hidden)}, "
-                 f"compare modified times={yn(o.compare_time)}, mirror (delete extras)={yn(o.mirror)}, "
+                 f"compare modified times={yn(o.compare_time)}, overwrite same-size newer={yn(o.newer_same_size)}, mirror (delete extras)={yn(o.mirror)}, "
                  f"verify={yn(o.verify)}, re-copy everything={yn(o.force)}, flush to disk={yn(o.fsync)}, "
                  f"chunk={o.chunk // (1024 * 1024)} MiB")
         self._lw()
@@ -534,7 +535,8 @@ class TransferEngine:
                     detail = "'Re-copy everything' is on"
                 elif st.st_size != size or not same_mtime(st.st_mtime_ns, mtime_ns):
                     time_only = st.st_size == size
-                    if time_only and not o.compare_time:
+                    src_newer = mtime_ns > st.st_mtime_ns + MTIME_TOLERANCE_NS
+                    if time_only and not (o.compare_time and o.newer_same_size and src_newer):
                         plan.time_ignored += 1       # same size => treated as identical (counted as up to date)
                     else:
                         reason = "changed"
@@ -933,6 +935,7 @@ class App:
         self.compare_time_var = tk.BooleanVar(value=flag("compare_time", True))
         self.verify_var = tk.BooleanVar(value=flag("verify", False))
         self.fsync_var = tk.BooleanVar(value=flag("fsync", True))
+        self.newer_same_size_var = tk.BooleanVar(value=False)
         self.mirror_var = tk.BooleanVar(value=False)
         self.force_var = tk.BooleanVar(value=False)
         self.preview_var = tk.BooleanVar(value=False)
@@ -947,6 +950,13 @@ class App:
             .pack(side="left")
         ttk.Label(trow, text="untick = a file with the same size counts as identical", foreground="#555555")\
             .pack(side="left", padx=(8, 0))
+
+        nrow = ttk.Frame(opts)
+        nrow.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(nrow, text="Overwrite same-size files that are newer on the source",
+                        variable=self.newer_same_size_var).pack(side="left")
+        ttk.Label(nrow, text="off = same size counts as identical (e.g. MiSTer touches file times)",
+                  foreground="#555555").pack(side="left", padx=(8, 0))
 
         mrow = ttk.Frame(opts)
         mrow.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -965,7 +975,7 @@ class App:
             .grid(row=2, column=3, sticky="w", padx=(20, 0), pady=(6, 0))
 
         chunk_row = ttk.Frame(opts)
-        chunk_row.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        chunk_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(chunk_row, text="Chunk (MiB):").pack(side="left")
         self.chunk_var = tk.IntVar(value=chunk_saved or CHUNK_DEFAULT // (1024 * 1024))
         self.sb_chunk = ttk.Spinbox(chunk_row, from_=1, to=256, textvariable=self.chunk_var, width=6,
@@ -1111,6 +1121,7 @@ class App:
             chunk=self._chunk_bytes(),
             skip_hidden=self.skip_hidden_var.get(),
             compare_time=self.compare_time_var.get(),
+            newer_same_size=self.newer_same_size_var.get(),
             mirror=self.mirror_var.get(),
             verify=self.verify_var.get(),
             force=self.force_var.get(),
