@@ -49,6 +49,7 @@ If the app's own folder isn't writable, logs go to `%LOCALAPPDATA%\CascadeTransf
 |---|---|
 | Skip hidden and system files | On by default. Also protects them from mirror deletion. `System Volume Information`, `$RECYCLE.BIN` etc. are always skipped. Symlinks/junctions are never followed. |
 | Compare modified times | On by default: a file is re-copied if its size **or** modified time differs. **Untick it** to treat any file with the same size as identical - use this when the destination was filled by a tool that didn't keep timestamps (every file then looks "newer" even though it's the same). A different *size* is always re-copied. The preview tells you how many files differ by time only. |
+| Overwrite same-size files that are newer on the destination | Off by default. A file with the same size whose destination modified time is newer than the source is normally left alone (useful when a device like a MiSTer updates file times whenever it touches them). Tick it to overwrite those files from the source. Not remembered between launches. |
 | Delete files on destination that aren't on source | Mirror mode (see above). |
 | Preview only | Scan and list what would change; touch nothing. |
 | Verify copies | Re-read each finished copy and compare a hash with what was read from the source. |
@@ -59,11 +60,11 @@ If the app's own folder isn't writable, logs go to `%LOCALAPPDATA%\CascadeTransf
 ## Remembered settings
 
 *Skip hidden*, *Compare modified times*, *Verify*, *Flush* and *Chunk* are remembered in
-`settings.json` (next to the app). Mirror, Preview and Re-copy everything always start off.
+`settings.json` (next to the app). Mirror, Preview, Re-copy everything and Overwrite same-size newer-on-destination always start off.
 
 ## Notes
 
-- Sync is **one-way**: Source wins. If a destination file differs and is *newer*, it is still
+- Sync is **one-way**: Source wins. If a destination file differs in size and is *newer*, it is still
   replaced (the log tells you how many files that affects before anything is copied).
 - Deletions are permanent (no Recycle Bin).
 - To rebuild the exe: `pyinstaller --onefile --windowed --collect-all tkinterdnd2 cascade_transferinator.py`
