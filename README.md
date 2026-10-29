@@ -64,7 +64,9 @@ If the app's own folder isn't writable, logs go to `%LOCALAPPDATA%\CascadeTransf
 
 ## Notes
 
-- Sync is **one-way**: Source wins. If a destination file differs in size and is *newer*, it is still
-  replaced (the log tells you how many files that affects before anything is copied).
+- Sync is **one-way**: Source wins. If a destination file has a different size, it is replaced even
+  when it is *newer* (the log tells you how many files that affects before anything is copied).
+  A same-size file that is newer on the destination is only replaced if you tick
+  *Overwrite same-size files that are newer on the destination*.
 - Deletions are permanent (no Recycle Bin).
 - To rebuild the exe: `pyinstaller --onefile --windowed --collect-all tkinterdnd2 cascade_transferinator.py`
