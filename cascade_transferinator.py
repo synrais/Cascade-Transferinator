@@ -750,8 +750,13 @@ class TransferEngine:
         self._phase = "Copying"
         self._t0 = self._win_t = time.monotonic()
         self._win_b = self.bytes_copied
-        for rel in plan.dirs:                        # empty folders too
+        last_post = 0.0
+        for n, rel in enumerate(plan.dirs, 1):       # empty folders too
             self._check_stop()
+            now = time.monotonic()
+            if now - last_post > 0.1 or n == len(plan.dirs):
+                last_post = now
+                self._post("folders", done=n, total=len(plan.dirs), rel=rel)
             try:
                 os.makedirs(ext(os.path.join(self.dst, rel)), exist_ok=True)
                 self._event(f"FOLDER   {rel}{os.sep}")
@@ -1170,6 +1175,12 @@ class App:
 
                 elif kind == "scan":
                     self.lbl_summary.config(text=f"Scanning... {p.get('count', 0):,} items")
+
+                elif kind == "folders":
+                    self.lbl_summary.config(text=f"Creating folders: {p['done']:,}/{p['total']:,}")
+                    self.pb_overall.config(maximum=max(1, p["total"]), value=p["done"])
+                    self.lbl_top.config(text=f"Current folder: {p['rel']}")
+                    self.lbl_rel.config(text="Current file: -")
 
                 elif kind == "progress":
                     self.lbl_summary.config(text=p["summary"])
